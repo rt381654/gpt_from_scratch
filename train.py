@@ -16,9 +16,10 @@ Run:
 import torch          # tensor operations and device management
 import torch.optim    # optimiser classes (AdamW)
 
-from model import GPT, count_parameters  # our transformer implementation
+from model import GPT, count_parameters        # our transformer implementation
 from data import build_toy_dataset, get_batch  # toy corpus + batch sampler
 from visualization import plot_loss_curves     # loss curve plotting
+from generate import generate                  # autoregressive token sampling
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +137,7 @@ def main():
     ).unsqueeze(0)  # (1, T)
 
     # Generate MAX_NEW_TOKENS new tokens autoregressively.
-    generated = model.generate(prompt, max_new_tokens=MAX_NEW_TOKENS, temperature=0.8, top_k=40)
+    generated = generate(model, prompt, max_new_tokens=MAX_NEW_TOKENS, temperature=0.8, top_k=40)
 
     # Decode the integer token ids back to a string.
     # generated[0] selects the first (only) sequence in the batch.

@@ -16,14 +16,16 @@ Model internals are split into focused modules:
   mlp.py                  — FeedForward
   positional_embedding.py — PositionalEmbedding
   block.py                — TransformerBlock (composes attention + mlp)
+  loss.py                 — compute_loss (cross-entropy over logits)
+  generate.py             — generate (autoregressive token sampling)
 """
 
 import torch                              # tensor operations and autograd
 import torch.nn as nn                     # building-block layers
-import torch.nn.functional as F           # cross_entropy, softmax
 
 from positional_embedding import PositionalEmbedding  # token + position embeddings
 from block import TransformerBlock                     # single transformer layer
+from loss import compute_loss                          # cross-entropy loss computation
 
 
 class GPT(nn.Module):
@@ -126,70 +128,10 @@ class GPT(nn.Module):
         logits = self.lm_head(x)          # project to vocab: (B, T, vocab_size)
 
         # --- Loss (optional) ---
-        loss = None
-        if targets is not None:
-            # Cross-entropy expects (N, C) logits and (N,) targets.
-            # Flatten both: (B*T, vocab_size) and (B*T,).
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),  # (B*T, vocab_size)
-                targets.view(-1),                  # (B*T,)
-            )
+        # Delegated to loss.py — see compute_loss() for details.
+        loss = compute_loss(logits, targets) if targets is not None else None
 
         return logits, loss
-
-    @torch.no_grad()
-    def generate(
-        self,
-        idx:            torch.Tensor,  # (B, T) prompt token ids
-        max_new_tokens: int,           # number of tokens to generate
-        temperature:    float = 1.0,   # >1 = more random, <1 = more peaked/greedy
-        top_k:          int   = None,  # if set, restrict sampling to top-k logits
-    ) -> torch.Tensor:
-        """
-        Autoregressive generation: repeatedly predict the next token and
-        append it to the sequence.
-
-        Args:
-            idx:            Prompt token ids, shape (B, T).
-            max_new_tokens: How many new tokens to sample.
-            temperature:    Scales logits before softmax (controls randomness).
-            top_k:          If set, zero out all but the top-k logit positions.
-        Returns:
-            idx: Extended token id tensor, shape (B, T + max_new_tokens).
-        """
-        for _ in range(max_new_tokens):
-            # Truncate the context to the last max_seq_len tokens if it has grown
-            # beyond what the positional embedding table supports.
-            max_seq_len = self.embedding.pos_emb.num_embeddings
-            idx_cond = idx[:, -max_seq_len:]  # (B, T') where T' <= max_seq_len
-
-            # Forward pass — we only care about the logits of the last position
-            # because that is the next-token prediction.
-            logits, _ = self(idx_cond)          # (B, T', vocab_size)
-            logits = logits[:, -1, :]           # (B, vocab_size) — last position only
-
-            # Apply temperature: dividing by a small number sharpens the distribution
-            # (makes the model more confident); dividing by >1 flattens it (more random).
-            logits = logits / temperature
-
-            # Top-k filtering: set all logits below the k-th largest to -inf so they
-            # get zero probability after softmax.  Encourages coherent generations.
-            if top_k is not None:
-                # torch.topk returns the k largest values; v[:, [-1]] is the k-th largest.
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float("-inf")
-
-            # Convert logits to probabilities.
-            probs = F.softmax(logits, dim=-1)  # (B, vocab_size)
-
-            # Sample one token index from the probability distribution.
-            # multinomial draws without replacement; num_samples=1 gives one token per batch.
-            next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
-
-            # Append the new token to the running sequence and continue.
-            idx = torch.cat([idx, next_token], dim=1)  # (B, T+1)
-
-        return idx  # (B, T + max_new_tokens)
 
 
 # ---------------------------------------------------------------------------
