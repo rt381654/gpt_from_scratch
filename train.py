@@ -13,47 +13,49 @@ Run:
     python train.py
 """
 
-import torch         # tensor operations and autograd
-import torch.nn.functional as F  # for cross_entropy used in evaluate()
+import torch          # tensor operations and device management
+import torch.optim    # optimiser classes (AdamW)
 
-from model import GPT, count_parameters
+from model import GPT, count_parameters  # our transformer implementation
 
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
 # ---------------------------------------------------------------------------
+# These are intentionally small so the model trains on a laptop CPU/GPU
+# within a few minutes.  Scale up for real tasks.
 
-BATCH_SIZE     = 32    # sequences per gradient step
-SEQ_LEN        = 32    # context window (tokens per sequence)
-D_MODEL        = 64    # embedding / hidden dimension
-N_HEADS        = 4     # attention heads (must divide D_MODEL)
-N_LAYERS       = 3     # transformer blocks stacked
-DROPOUT        = 0.1   # dropout probability
-LR             = 1e-3  # learning rate (slightly higher for small model / toy data)
-MAX_ITERS      = 500   # total training steps
-EVAL_EVERY     = 50    # evaluate and print metrics every N steps
-EVAL_ITERS     = 20    # number of batches averaged when estimating eval loss
-MAX_NEW_TOKENS = 60    # tokens to generate in the final sample
+BATCH_SIZE   = 16    # number of independent sequences processed in one step
+SEQ_LEN      = 64    # number of tokens per training sequence (context window)
+D_MODEL      = 128   # embedding / hidden dimension (width)
+N_HEADS      = 4     # number of attention heads (must divide D_MODEL evenly)
+N_LAYERS     = 4     # number of stacked transformer blocks (depth)
+DROPOUT      = 0.1   # fraction of activations randomly zeroed during training
+LR           = 3e-4  # learning rate for AdamW (3e-4 is a classic safe default)
+MAX_ITERS    = 2000  # total number of gradient update steps
+EVAL_EVERY   = 200   # print loss every this many steps
+MAX_NEW_TOKENS = 200 # tokens to generate in the sample at the end
 
 # ---------------------------------------------------------------------------
 # Device
 # ---------------------------------------------------------------------------
-
+# Use a GPU if one is available; otherwise fall back to CPU.
+# .to(device) later moves tensors and models to the selected device.
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 
 # ---------------------------------------------------------------------------
-# Toy Dataset
+# Toy Dataset — single-digit addition facts
 # ---------------------------------------------------------------------------
-# We build a small character-level arithmetic corpus entirely in memory.
-# Each example looks like "3+5=8" — simple enough that a tiny model can
-# memorise the pattern and show clear loss curves within ~500 steps.
 
-def build_toy_dataset():
+def get_data():
     """
-    Generate all single-digit addition facts (a + b = c, a and b in 0-9),
-    repeated enough times to form a corpus of ~50 k characters.
+    Build a character-level arithmetic corpus entirely in memory.
+
+    Each example looks like "a+b=c, " for all single-digit pairs a, b ∈ 0-9.
+    The 100 unique facts are repeated to form a corpus of ~50k characters.
+    No external files required.
 
     Returns:
         data       : 1-D LongTensor of token ids covering the entire corpus
@@ -64,23 +66,26 @@ def build_toy_dataset():
     # Build every addition fact as a short string: "a+b=c, "
     # Using all pairs (a, b) where a, b ∈ {0…9} gives 100 unique facts.
     facts = []
-    for a in range(10):          # first operand 0-9
-        for b in range(10):      # second operand 0-9
-            c = a + b            # correct sum (0-18; may be two digits)
-            facts.append(f"{a}+{b}={c}, ")  # e.g. "3+7=10, "
+    for a in range(10):       # first operand 0-9
+        for b in range(10):   # second operand 0-9
+            c = a + b         # correct sum (may be two digits, e.g. 9+9=18)
+            facts.append(f"{a}+{b}={c}, ")
 
-    # Repeat the fact list many times to give the model plenty of examples.
-    # ~600 characters per pass × 80 repeats ≈ 48 000 characters total.
-    corpus = "".join(facts * 80)
+    # Repeat many times so the corpus is large enough for stable mini-batch training.
+    # ~700 characters per pass × 80 repeats ≈ 56 000 characters total.
+    text = "".join(facts * 80)
 
-    # --- Character-level vocabulary ---
-    chars      = sorted(set(corpus))          # unique chars, sorted for reproducibility
-    vocab_size = len(chars)
-    stoi = {ch: i for i, ch in enumerate(chars)}  # char → int
-    itos = {i: ch for i, ch in enumerate(chars)}  # int  → char
+    # --- Build vocabulary ---
+    chars = sorted(set(text))   # unique characters in sorted order
+    vocab_size = len(chars)     # number of distinct tokens
 
-    # Encode the entire corpus as a LongTensor of token ids.
-    data = torch.tensor([stoi[ch] for ch in corpus], dtype=torch.long)
+    # Two lookup dictionaries for encoding (char→int) and decoding (int→char).
+    stoi = {ch: i for i, ch in enumerate(chars)}  # string-to-index
+    itos = {i: ch for i, ch in enumerate(chars)}  # index-to-string
+
+    # Encode: convert entire text to a list of integer ids, then wrap in a
+    # long (int64) tensor which nn.Embedding expects.
+    data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
 
     return data, vocab_size, stoi, itos
 
@@ -89,51 +94,29 @@ def build_toy_dataset():
 # Batch Sampler
 # ---------------------------------------------------------------------------
 
-def get_batch(data: torch.Tensor):
+def get_batch(data: torch.Tensor, batch_size: int, seq_len: int, device: str):
     """
-    Sample BATCH_SIZE random (input, target) pairs from `data`.
+    Sample a random mini-batch of (input, target) sequence pairs.
 
-    The target is the input shifted one position to the right:
-        input  = data[i   : i+SEQ_LEN]
-        target = data[i+1 : i+SEQ_LEN+1]
-    so the model learns to predict the next token at every position.
+    Language modelling is a one-step-ahead prediction task:
+      - inputs[b]  = data[i   : i+seq_len]
+      - targets[b] = data[i+1 : i+seq_len+1]
+    Each target token is the token that follows the corresponding input token.
+    The model must learn to predict target[t] given inputs[0..t].
+
+    Returns:
+        x: (batch_size, seq_len) input token ids
+        y: (batch_size, seq_len) target token ids (shifted by one position)
     """
-    # Random start indices; ensure at least SEQ_LEN+1 tokens remain after each.
-    ix = torch.randint(len(data) - SEQ_LEN - 1, (BATCH_SIZE,))
-    x  = torch.stack([data[i    : i + SEQ_LEN    ] for i in ix])  # inputs
-    y  = torch.stack([data[i + 1: i + SEQ_LEN + 1] for i in ix])  # targets
+    # Sample batch_size random starting positions, leaving room for seq_len+1 tokens.
+    ix = torch.randint(len(data) - seq_len - 1, (batch_size,))
+
+    # Stack individual sequences into (batch_size, seq_len) tensors.
+    x = torch.stack([data[i    : i + seq_len    ] for i in ix])
+    y = torch.stack([data[i + 1: i + seq_len + 1] for i in ix])
+
+    # Move to the compute device (GPU/CPU).
     return x.to(device), y.to(device)
-
-
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()   # decorator disables gradient tracking for the entire function
-def evaluate(model: GPT, train_data: torch.Tensor, val_data: torch.Tensor) -> dict:
-    """
-    Estimate average loss over EVAL_ITERS random batches from each split.
-
-    Using multiple batches (rather than a single batch) gives a lower-variance
-    loss estimate, which produces smoother and more reliable loss curves.
-
-    Returns a dict with keys "train" and "val", each holding a float loss.
-    """
-    model.eval()   # disable dropout for deterministic evaluation
-
-    results = {}
-    splits  = {"train": train_data, "val": val_data}
-
-    for split_name, split_data in splits.items():
-        losses = torch.zeros(EVAL_ITERS)   # pre-allocate tensor to store each batch loss
-        for k in range(EVAL_ITERS):
-            x, y       = get_batch(split_data)
-            _, loss    = model(x, y)       # forward pass only; no .backward()
-            losses[k]  = loss.item()       # store scalar loss for this batch
-        results[split_name] = losses.mean().item()  # average across all eval batches
-
-    model.train()  # re-enable dropout before returning to the training loop
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -141,18 +124,14 @@ def evaluate(model: GPT, train_data: torch.Tensor, val_data: torch.Tensor) -> di
 # ---------------------------------------------------------------------------
 
 def main():
-    # --- Build dataset ---
-    data, vocab_size, stoi, itos = build_toy_dataset()
-    print(f"Corpus size : {len(data):,} tokens")
-    print(f"Vocab size  : {vocab_size}  ({list(itos.values())})")
+    # --- Load data ---
+    data, vocab_size, stoi, itos = get_data()
+    print(f"Dataset size: {len(data):,} tokens | Vocab size: {vocab_size}")
 
-    # 90 / 10 train-validation split.
-    # The split is a fixed index cut rather than a shuffle so that there is no
-    # data leakage between the two sets.
-    n          = int(0.9 * len(data))
-    train_data = data[:n]   # first 90 % for learning
-    val_data   = data[n:]   # last  10 % held out for evaluation
-    print(f"Train tokens: {len(train_data):,}  |  Val tokens: {len(val_data):,}\n")
+    # Split into 90% train / 10% validation.
+    n = int(0.9 * len(data))
+    train_data = data[:n]
+    val_data   = data[n:]
 
     # --- Build model ---
     model = GPT(
@@ -162,71 +141,69 @@ def main():
         n_layers    = N_LAYERS,
         max_seq_len = SEQ_LEN,
         dropout     = DROPOUT,
-    ).to(device)
+    ).to(device)  # move all parameters and buffers to the selected device
 
-    print(f"Model parameters: {count_parameters(model):,}\n")
+    print(f"Model parameters: {count_parameters(model):,}")
 
     # --- Optimiser ---
-    # AdamW uses adaptive per-parameter learning rates (Adam) plus decoupled
-    # weight decay which acts as L2 regularisation without interfering with
-    # the adaptive moment estimates.
+    # AdamW = Adam with decoupled weight decay.
+    # Adam maintains per-parameter adaptive learning rates (good for sparse gradients).
+    # Weight decay (L2 regularisation) penalises large weights to prevent overfitting.
     optimiser = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-1)
 
     # --- Training loop ---
-    print(f"{'Step':>6}  {'Train Loss':>10}  {'Val Loss':>10}")
-    print("-" * 32)
-
-    model.train()  # activate dropout
+    model.train()  # activates dropout (nn.Dropout is a no-op during eval)
 
     for step in range(1, MAX_ITERS + 1):
+        # Sample a random mini-batch from the training split.
+        x, y = get_batch(train_data, BATCH_SIZE, SEQ_LEN, device)
 
-        # Periodic evaluation — runs before the gradient step so that step 1
-        # gives us the baseline (untrained) loss.
-        if step % EVAL_EVERY == 0 or step == 1:
-            metrics = evaluate(model, train_data, val_data)
-            print(f"{step:>6}  {metrics['train']:>10.4f}  {metrics['val']:>10.4f}")
-            model.train()  # evaluate() sets model.eval(); restore training mode
+        # Forward pass: compute predictions and loss.
+        # logits: (B, T, vocab_size), loss: scalar cross-entropy
+        logits, loss = model(x, y)
 
-        # ----- Gradient step -----
-        x, y = get_batch(train_data)        # sample a random mini-batch
+        # Backward pass: compute gradients of loss w.r.t. all parameters.
+        optimiser.zero_grad()  # clear gradients from the previous step (they accumulate by default)
+        loss.backward()        # backpropagation through the entire graph
 
-        logits, loss = model(x, y)          # forward pass → cross-entropy loss
-
-        optimiser.zero_grad()               # clear stale gradients from last step
-        loss.backward()                     # backprop: compute ∂loss/∂θ for all θ
-
-        # Clip gradients to prevent exploding updates in early training.
+        # Gradient clipping: if the global gradient norm exceeds 1.0, scale all
+        # gradients down proportionally.  Prevents exploding gradients which can
+        # occur in deep networks and derail training.
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        optimiser.step()                    # θ ← θ − lr · grad
+        optimiser.step()  # update parameters: θ ← θ - lr * grad
 
-    # Final evaluation after all training steps.
-    metrics = evaluate(model, train_data, val_data)
-    print("-" * 32)
-    print(f"{'Final':>6}  {metrics['train']:>10.4f}  {metrics['val']:>10.4f}")
+        # --- Periodic evaluation ---
+        if step % EVAL_EVERY == 0 or step == 1:
+            # Estimate validation loss without updating parameters.
+            model.eval()  # deactivates dropout for consistent evaluation
+            with torch.no_grad():  # disable gradient tracking to save memory and compute
+                val_x, val_y = get_batch(val_data, BATCH_SIZE, SEQ_LEN, device)
+                _, val_loss = model(val_x, val_y)
+            model.train()  # switch back to training mode
+
+            print(f"Step {step:>5} | train loss: {loss.item():.4f} | val loss: {val_loss.item():.4f}")
 
     # --- Generate a sample ---
-    # Feed the model a short prompt and let it complete the sequence.
-    # This gives a qualitative feel for what the model has learned.
     print("\n--- Generated sample (prompt: '3+') ---")
     model.eval()
+    prompt_str = "3+"
+    prompt = torch.tensor(
+        [stoi[ch] for ch in prompt_str],  # encode the prompt characters
+        dtype=torch.long,
+        device=device,
+    ).unsqueeze(0)  # (1, T)
 
-    prompt_str = "3+"                              # the prompt we condition on
-    prompt_ids = [stoi[ch] for ch in prompt_str]  # encode each character
-    prompt_tensor = torch.tensor(
-        prompt_ids, dtype=torch.long, device=device
-    ).unsqueeze(0)  # add batch dim: (T,) → (1, T)
+    # Generate MAX_NEW_TOKENS new tokens autoregressively.
+    generated = model.generate(prompt, max_new_tokens=MAX_NEW_TOKENS, temperature=0.8, top_k=40)
 
-    generated = model.generate(
-        prompt_tensor,
-        max_new_tokens = MAX_NEW_TOKENS,
-        temperature    = 0.5,   # low temperature → more deterministic / confident output
-        top_k          = 10,    # restrict sampling to the 10 most likely next tokens
-    )
-
-    # Decode token ids back to a string and print.
+    # Decode the integer token ids back to a string.
+    # generated[0] selects the first (only) sequence in the batch.
+    # .tolist() converts the tensor to a Python list for iteration.
     print("".join(itos[i] for i in generated[0].tolist()))
 
 
 if __name__ == "__main__":
+    # Standard Python guard: only run main() when this script is executed
+    # directly (not when it is imported as a module by another script).
     main()
