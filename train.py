@@ -76,8 +76,8 @@ def get_data():
     text = "".join(facts * 80)
 
     # --- Build vocabulary ---
-    chars = sorted(set(text))   # unique characters in sorted order
-    vocab_size = len(chars)     # number of distinct tokens
+    chars = sorted(set(text))          # unique characters in sorted order
+    vocab_size = len(chars)            # number of distinct tokens
 
     # Two lookup dictionaries for encoding (char→int) and decoding (int→char).
     stoi = {ch: i for i, ch in enumerate(chars)}  # string-to-index
@@ -187,6 +187,8 @@ def main():
     # --- Generate a sample ---
     print("\n--- Generated sample (prompt: '3+') ---")
     model.eval()
+    # Start generation from a short prompt string.
+    # unsqueeze(0) adds the batch dimension: (T,) → (1, T).
     prompt_str = "3+"
     prompt = torch.tensor(
         [stoi[ch] for ch in prompt_str],  # encode the prompt characters
