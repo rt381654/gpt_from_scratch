@@ -1,9 +1,13 @@
 """
-Minimal Training Loop
-=====================
-Demonstrates how to train the GPT model on a tiny character-level dataset
-(Shakespeare).  The entire dataset fits in RAM, so there is no DataLoader —
-just random batch sampling from a flat tensor of token ids.
+Training and Evaluation on a Toy Dataset
+=========================================
+Trains the GPT model on a small built-in toy dataset — no external files needed.
+
+The toy dataset is a repeating arithmetic sequence of the form:
+    "1+1=2, 1+2=3, 2+1=3, 1+3=4, ..."
+This gives the model a simple, learnable pattern that shows clear loss
+improvement within a few hundred steps, making it easy to verify that
+training is working correctly.
 
 Run:
     python train.py
@@ -42,26 +46,34 @@ print(f"Using device: {device}")
 
 
 # ---------------------------------------------------------------------------
-# Data — Tiny Shakespeare (character-level)
+# Toy Dataset — single-digit addition facts
 # ---------------------------------------------------------------------------
 
-def get_data(path: str = "input.txt"):
+def get_data():
     """
-    Load a plain-text file, build a character-level vocabulary, and encode
-    the entire text as a 1-D tensor of integer token ids.
+    Build a character-level arithmetic corpus entirely in memory.
 
-    Character-level tokenisation is the simplest possible scheme:
-      - vocab_size == number of unique characters in the file
-      - each token is one character
+    Each example looks like "a+b=c, " for all single-digit pairs a, b ∈ 0-9.
+    The 100 unique facts are repeated to form a corpus of ~50k characters.
+    No external files required.
+
+    Returns:
+        data       : 1-D LongTensor of token ids covering the entire corpus
+        vocab_size : number of unique characters
+        stoi       : char → int encoding dict
+        itos       : int  → char decoding dict
     """
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
-    except FileNotFoundError:
-        # If the file is absent, generate a tiny synthetic dataset so the
-        # script still runs end-to-end without downloading anything.
-        print("input.txt not found — using a tiny synthetic dataset.")
-        text = ("To be, or not to be, that is the question.\n" * 200)
+    # Build every addition fact as a short string: "a+b=c, "
+    # Using all pairs (a, b) where a, b ∈ {0…9} gives 100 unique facts.
+    facts = []
+    for a in range(10):       # first operand 0-9
+        for b in range(10):   # second operand 0-9
+            c = a + b         # correct sum (may be two digits, e.g. 9+9=18)
+            facts.append(f"{a}+{b}={c}, ")
+
+    # Repeat many times so the corpus is large enough for stable mini-batch training.
+    # ~700 characters per pass × 80 repeats ≈ 56 000 characters total.
+    text = "".join(facts * 80)
 
     # --- Build vocabulary ---
     chars = sorted(set(text))          # unique characters in sorted order
@@ -173,16 +185,16 @@ def main():
             print(f"Step {step:>5} | train loss: {loss.item():.4f} | val loss: {val_loss.item():.4f}")
 
     # --- Generate a sample ---
-    print("\n--- Generated sample ---")
+    print("\n--- Generated sample (prompt: '3+') ---")
     model.eval()
-    # Start generation from a single newline character as the prompt.
+    # Start generation from a short prompt string.
     # unsqueeze(0) adds the batch dimension: (T,) → (1, T).
-    start_char = "\n"
+    prompt_str = "3+"
     prompt = torch.tensor(
-        [stoi.get(start_char, 0)],  # encode the prompt character
+        [stoi[ch] for ch in prompt_str],  # encode the prompt characters
         dtype=torch.long,
         device=device,
-    ).unsqueeze(0)  # (1, 1)
+    ).unsqueeze(0)  # (1, T)
 
     # Generate MAX_NEW_TOKENS new tokens autoregressively.
     generated = model.generate(prompt, max_new_tokens=MAX_NEW_TOKENS, temperature=0.8, top_k=40)
