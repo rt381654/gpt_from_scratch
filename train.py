@@ -15,9 +15,11 @@ Run:
 
 import torch          # tensor operations and device management
 import torch.optim    # optimiser classes (AdamW)
-import matplotlib.pyplot as plt  # plotting the loss curves at the end of training
 
-from model import GPT, count_parameters  # our transformer implementation
+from model import GPT, count_parameters        # our transformer implementation
+from data import build_toy_dataset, get_batch  # toy corpus + batch sampler
+from visualization import plot_loss_curves     # loss curve plotting
+from generate import generate                  # autoregressive token sampling
 
 
 # ---------------------------------------------------------------------------
@@ -47,87 +49,13 @@ print(f"Using device: {device}")
 
 
 # ---------------------------------------------------------------------------
-# Toy Dataset — single-digit addition facts
-# ---------------------------------------------------------------------------
-
-def get_data():
-    """
-    Build a character-level arithmetic corpus entirely in memory.
-
-    Each example looks like "a+b=c, " for all single-digit pairs a, b ∈ 0-9.
-    The 100 unique facts are repeated to form a corpus of ~50k characters.
-    No external files required.
-
-    Returns:
-        data       : 1-D LongTensor of token ids covering the entire corpus
-        vocab_size : number of unique characters
-        stoi       : char → int encoding dict
-        itos       : int  → char decoding dict
-    """
-    # Build every addition fact as a short string: "a+b=c, "
-    # Using all pairs (a, b) where a, b ∈ {0…9} gives 100 unique facts.
-    facts = []
-    for a in range(10):       # first operand 0-9
-        for b in range(10):   # second operand 0-9
-            c = a + b         # correct sum (may be two digits, e.g. 9+9=18)
-            facts.append(f"{a}+{b}={c}, ")
-
-    # Repeat many times so the corpus is large enough for stable mini-batch training.
-    # ~700 characters per pass × 80 repeats ≈ 56 000 characters total.
-    text = "".join(facts * 80)
-
-    # --- Build vocabulary ---
-    chars = sorted(set(text))          # unique characters in sorted order
-    vocab_size = len(chars)            # number of distinct tokens
-
-    # Two lookup dictionaries for encoding (char→int) and decoding (int→char).
-    stoi = {ch: i for i, ch in enumerate(chars)}  # string-to-index
-    itos = {i: ch for i, ch in enumerate(chars)}  # index-to-string
-
-    # Encode: convert entire text to a list of integer ids, then wrap in a
-    # long (int64) tensor which nn.Embedding expects.
-    data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
-
-    return data, vocab_size, stoi, itos
-
-
-# ---------------------------------------------------------------------------
-# Batch Sampler
-# ---------------------------------------------------------------------------
-
-def get_batch(data: torch.Tensor, batch_size: int, seq_len: int, device: str):
-    """
-    Sample a random mini-batch of (input, target) sequence pairs.
-
-    Language modelling is a one-step-ahead prediction task:
-      - inputs[b]  = data[i   : i+seq_len]
-      - targets[b] = data[i+1 : i+seq_len+1]
-    Each target token is the token that follows the corresponding input token.
-    The model must learn to predict target[t] given inputs[0..t].
-
-    Returns:
-        x: (batch_size, seq_len) input token ids
-        y: (batch_size, seq_len) target token ids (shifted by one position)
-    """
-    # Sample batch_size random starting positions, leaving room for seq_len+1 tokens.
-    ix = torch.randint(len(data) - seq_len - 1, (batch_size,))
-
-    # Stack individual sequences into (batch_size, seq_len) tensors.
-    x = torch.stack([data[i    : i + seq_len    ] for i in ix])
-    y = torch.stack([data[i + 1: i + seq_len + 1] for i in ix])
-
-    # Move to the compute device (GPU/CPU).
-    return x.to(device), y.to(device)
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
     # --- Load data ---
-    data, vocab_size, stoi, itos = get_data()
-    print(f"Dataset size: {len(data):,} tokens | Vocab size: {vocab_size}")
+    data, tokenizer = build_toy_dataset()  # returns token tensor + fitted Tokenizer
+    print(f"Dataset size: {len(data):,} tokens | Vocab size: {tokenizer.vocab_size}")
 
     # Split into 90% train / 10% validation.
     n = int(0.9 * len(data))
@@ -136,7 +64,7 @@ def main():
 
     # --- Build model ---
     model = GPT(
-        vocab_size  = vocab_size,
+        vocab_size  = tokenizer.vocab_size,
         d_model     = D_MODEL,
         n_heads     = N_HEADS,
         n_layers    = N_LAYERS,
@@ -194,20 +122,7 @@ def main():
             print(f"Step {step:>5} | train loss: {loss.item():.4f} | val loss: {val_loss.item():.4f}")
 
     # --- Plot loss curves ---
-    # Unzip the (step, loss) pairs into separate lists for the x and y axes.
-    steps_recorded, train_loss_values = zip(*train_losses)
-    _,              val_loss_values   = zip(*val_losses)
-
-    plt.figure()                                          # create a new figure
-    plt.plot(steps_recorded, train_loss_values, label="train loss")  # blue line by default
-    plt.plot(steps_recorded, val_loss_values,   label="val loss")    # orange line by default
-    plt.xlabel("Step")                                    # label the x-axis
-    plt.ylabel("Loss")                                    # label the y-axis
-    plt.title("Training and Validation Loss")             # chart title
-    plt.legend()                                          # show the label legend
-    plt.tight_layout()                                    # avoid clipping labels
-    plt.savefig("loss_curve.png")                         # save to disk instead of blocking on plt.show()
-    print("\nLoss curve saved to loss_curve.png")
+    plot_loss_curves(train_losses, val_losses)  # saves loss_curve.png
 
     # --- Generate a sample ---
     print("\n--- Generated sample (prompt: '3+') ---")
@@ -216,18 +131,18 @@ def main():
     # unsqueeze(0) adds the batch dimension: (T,) → (1, T).
     prompt_str = "3+"
     prompt = torch.tensor(
-        [stoi[ch] for ch in prompt_str],  # encode the prompt characters
+        tokenizer.encode(prompt_str),  # encode the prompt characters
         dtype=torch.long,
         device=device,
     ).unsqueeze(0)  # (1, T)
 
     # Generate MAX_NEW_TOKENS new tokens autoregressively.
-    generated = model.generate(prompt, max_new_tokens=MAX_NEW_TOKENS, temperature=0.8, top_k=40)
+    generated = generate(model, prompt, max_new_tokens=MAX_NEW_TOKENS, temperature=0.8, top_k=40)
 
     # Decode the integer token ids back to a string.
     # generated[0] selects the first (only) sequence in the batch.
     # .tolist() converts the tensor to a Python list for iteration.
-    print("".join(itos[i] for i in generated[0].tolist()))
+    print(tokenizer.decode(generated[0].tolist()))
 
 
 if __name__ == "__main__":
