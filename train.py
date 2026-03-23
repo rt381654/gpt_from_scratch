@@ -15,6 +15,7 @@ Run:
 
 import torch          # tensor operations and device management
 import torch.optim    # optimiser classes (AdamW)
+import matplotlib.pyplot as plt  # plotting the loss curves at the end of training
 
 from model import GPT, count_parameters  # our transformer implementation
 
@@ -151,6 +152,10 @@ def main():
     # Weight decay (L2 regularisation) penalises large weights to prevent overfitting.
     optimiser = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-1)
 
+    # Lists to accumulate (step, loss) pairs for plotting after training.
+    train_losses = []  # stores (step, train_loss) at each eval checkpoint
+    val_losses   = []  # stores (step, val_loss)   at each eval checkpoint
+
     # --- Training loop ---
     model.train()  # activates dropout (nn.Dropout is a no-op during eval)
 
@@ -182,7 +187,27 @@ def main():
                 _, val_loss = model(val_x, val_y)
             model.train()  # switch back to training mode
 
+            # Record losses for the plot; loss.item() is the current training batch loss.
+            train_losses.append((step, loss.item()))
+            val_losses.append((step, val_loss.item()))
+
             print(f"Step {step:>5} | train loss: {loss.item():.4f} | val loss: {val_loss.item():.4f}")
+
+    # --- Plot loss curves ---
+    # Unzip the (step, loss) pairs into separate lists for the x and y axes.
+    steps_recorded, train_loss_values = zip(*train_losses)
+    _,              val_loss_values   = zip(*val_losses)
+
+    plt.figure()                                          # create a new figure
+    plt.plot(steps_recorded, train_loss_values, label="train loss")  # blue line by default
+    plt.plot(steps_recorded, val_loss_values,   label="val loss")    # orange line by default
+    plt.xlabel("Step")                                    # label the x-axis
+    plt.ylabel("Loss")                                    # label the y-axis
+    plt.title("Training and Validation Loss")             # chart title
+    plt.legend()                                          # show the label legend
+    plt.tight_layout()                                    # avoid clipping labels
+    plt.savefig("loss_curve.png")                         # save to disk instead of blocking on plt.show()
+    print("\nLoss curve saved to loss_curve.png")
 
     # --- Generate a sample ---
     print("\n--- Generated sample (prompt: '3+') ---")
